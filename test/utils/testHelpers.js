@@ -1,4 +1,7 @@
 const { ether } = require('@openzeppelin/test-helpers');
+const { create, all } = require('mathjs')
+const config = {}
+const mathjs = create(all, config)
 
 const tokens = (x) => {
     return ether(x).toString()
@@ -22,10 +25,17 @@ const toUtf8Bytes = (x) => {
     return ethers.utils.toUtf8Bytes(x)
 }
 
+const calculateUSDToUNN = (usdt, current_token) => {
+    return mathjs.floor(
+        mathjs.evaluate('(sqrt(86490003459600034596 * ' + current_token + '^2 - 163680006819690072651600034596 * ' + current_token + ' + 18600000372 *' + usdt + ' + 77440003355440037984222535460900008649) - 9300000186 * ' + current_token + ' + 8800000190650000093)/9300000186')
+    )
+}
+
 module.exports = {
     tokens,
     increaseTime,
     getTime,
     keccak256,
-    toUtf8Bytes
+    toUtf8Bytes,
+    calculateUSDToUNN
 }

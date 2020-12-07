@@ -1,12 +1,17 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const expectRevert = require('./utils/expectRevert')
-const { tokens } = require('./utils/testHelpers')
+const { tokens, calculateUSDToUNN } = require('./utils/testHelpers')
+const BN = require("bn.js");
+const { create, all } = require('mathjs')
+const config = {}
+const mathjs = create(all, config)
 
 describe("UnionProtocolTokenSale", () => {
     let unionProtocolTokenSaleInstance,
         unnGovernanceToken,
         daiToken,
+        usdtToken,
         owner,
         governor,
         publicUser1,
@@ -52,10 +57,25 @@ describe("UnionProtocolTokenSale", () => {
         ] = await ethers.getSigners(20);
 
         //deploy test ERC20 contract serving as DAI mock
-        const ERC20TokenContract = await ethers.getContractFactory("ERC20PresetMinterPauser");
-        daiToken = await ERC20TokenContract.connect(publicUser1).deploy("DAI", "DAI");
+        // const DAIMockTokenContract = await ethers.getContractFactory("DAIMockToken");
+        // daiToken = await DAIMockTokenContract.connect(publicUser1).deploy(tokens('10000000'));
+        // await daiToken.deployed();
+
+        const DAIMockTokenContract = await ethers.getContractFactory("Dai");
+        daiToken = await DAIMockTokenContract.deploy((await ethers.provider.getNetwork()).chainId);
         await daiToken.deployed();
-        await daiToken.mint(publicUser1.address,tokens('99999'));
+        await daiToken.mint(owner.address, tokens('100000000000'));
+        await daiToken.transfer(publicUser1.address,tokens('100000000000'));
+
+        //deploy test ERC20 contract serving as USDT mock
+        // const USDTMockTokenContract = await ethers.getContractFactory("USDTMockToken");
+        // usdtToken = await USDTMockTokenContract.connect(publicUser1).deploy(tokens('10000000'));
+        // await usdtToken.deployed();
+
+        const USDTMockTokenContract = await ethers.getContractFactory("TetherToken");
+        usdtToken = await USDTMockTokenContract.deploy('100000000000000000', 'Tether', 'USDT', 6);
+        await usdtToken.deployed();
+        await usdtToken.transfer(publicUser1.address, '100000000000000000')
 
         const DateTime = await ethers.getContractFactory("DateTime");
         const dateTimeLib = await DateTime.deploy();
@@ -111,7 +131,6 @@ describe("UnionProtocolTokenSale", () => {
         );
     });
 
-
     /**
      * BASIC CONTRACT TESTS
      */
@@ -125,7 +144,6 @@ describe("UnionProtocolTokenSale", () => {
         let bonusTokenLockPeriod = await unionProtocolTokenSaleInstance.getBonusTokenLockPeriod();
         expect(bonusTokenLockPeriod).to.equal(12);
     })
-
 
     /**
      * BONUS TOKEN CONFIGURATION
@@ -166,7 +184,6 @@ describe("UnionProtocolTokenSale", () => {
         );
     });
 
-
     /**
      * WALLET ADDRESS SETTINGS
      */
@@ -206,7 +223,6 @@ describe("UnionProtocolTokenSale", () => {
         expect(address).to.equal("0x74cd8B09612b814d42107c11DAD5EB16956dAA89");
     });
 
-
     /**
      * ROLES AND ACCESS CONTROL
      */
@@ -222,27 +238,71 @@ describe("UnionProtocolTokenSale", () => {
         expect(savedGovernor.toString()).to.equal(governor.address);
     });
 
-
     /**
      * SUPPORTED TOKENS CONFIGURATION
      */
     it("Should add and remove a supported token", async function() {
-        await unionProtocolTokenSaleInstance.addSupportedToken(
-            ethers.utils.formatBytes32String("DAI"),
-            daiToken.address
-        )
-        let tokenAddress = await unionProtocolTokenSaleInstance.getSupportedTokenAddress(
-            ethers.utils.formatBytes32String("DAI")
-        )
-        expect(tokenAddress.toString()).to.equal(daiToken.address);
+        const tokenName = "DAI";
+        const tokenDecimals = 18;
 
-        await unionProtocolTokenSaleInstance.removeSupportedToken(ethers.utils.formatBytes32String("DAI"));
-        tokenAddress = await unionProtocolTokenSaleInstance.getSupportedTokenAddress(
-            ethers.utils.formatBytes32String("DAI")
+        await unionProtocolTokenSaleInstance.addSupportedToken(
+            ethers.utils.formatBytes32String(tokenName),
+            daiToken.address,
+            tokenDecimals
+        )
+        const supportedTokenAddressAdded = await unionProtocolTokenSaleInstance.getSupportedTokenAddress(
+            ethers.utils.formatBytes32String(tokenName)
+        )
+        expect(supportedTokenAddressAdded.toString()).to.equal(daiToken.address);
+
+        const supportedTokenDecimalsAdded = await unionProtocolTokenSaleInstance.getSupportedTokenDecimals(
+            ethers.utils.formatBytes32String(tokenName)
+        )
+        expect(supportedTokenDecimalsAdded).to.equal(tokenDecimals);
+
+        await unionProtocolTokenSaleInstance.removeSupportedToken(ethers.utils.formatBytes32String(tokenName));
+        const supportedTokenAddressRemoved = await unionProtocolTokenSaleInstance.getSupportedTokenAddress(
+            ethers.utils.formatBytes32String(tokenName)
         );
-        expect(tokenAddress.toString()).to.equal(ethers.constants.AddressZero);
+        const supportedTokenDecimalsRemoved = await unionProtocolTokenSaleInstance.getSupportedTokenDecimals(
+            ethers.utils.formatBytes32String(tokenName)
+        )
+        expect(supportedTokenAddressRemoved.toString()).to.equal(ethers.constants.AddressZero);
+        expect(supportedTokenDecimalsRemoved).to.equal(ethers.constants.Zero);
     });
 
+    it("Should throw an error when trying to add the same token more than once", async function (){
+        const tokenName = "DAI";
+        const tokenDecimals = 18;
+
+        await unionProtocolTokenSaleInstance.addSupportedToken(
+            ethers.utils.formatBytes32String(tokenName),
+            daiToken.address,
+            tokenDecimals
+        )
+
+        await expectRevert(
+            unionProtocolTokenSaleInstance.addSupportedToken(
+                ethers.utils.formatBytes32String(tokenName),
+                daiToken.address,
+                tokenDecimals
+            ),
+            "UPTS_ERROR: Token already exists. Remove it before modifying",
+        );
+
+        await unionProtocolTokenSaleInstance.removeSupportedToken(ethers.utils.formatBytes32String(tokenName));
+
+        await unionProtocolTokenSaleInstance.addSupportedToken(
+            ethers.utils.formatBytes32String(tokenName),
+            daiToken.address,
+            6
+        );
+
+        const supportedTokenDecimals = await unionProtocolTokenSaleInstance.getSupportedTokenDecimals(
+            ethers.utils.formatBytes32String(tokenName)
+        );
+        expect(supportedTokenDecimals).to.equal(6);
+    });
 
     /**
      * PERMITTING USERS TO BUY TOKENS
@@ -270,8 +330,6 @@ describe("UnionProtocolTokenSale", () => {
         expect(AddedSavedIsPrecheck).to.equal(isPrecheck);
         expect(AddedSavedTokenAmount).to.equal(tokenAmount);
 
-
-
         await unionProtocolTokenSaleInstance.removeFromPermittedList(publicUser1.address);
         let savedIsPermitted = await unionProtocolTokenSaleInstance.getAddressPermittedApprovalStatus(
             publicUser1.address
@@ -286,9 +344,6 @@ describe("UnionProtocolTokenSale", () => {
         expect(savedIsPrecheck).to.equal(false);
         expect(savedTokenAmount).to.equal(0);
     });
-
-
-
 
     /**
      * TOKEN GENERATION & SALE
@@ -329,6 +384,12 @@ describe("UnionProtocolTokenSale", () => {
 
         let supplyReservePoolWalletBalance = await unnGovernanceToken.balanceOf(supplyReservePoolWallet.address);
         expect(supplyReservePoolWalletBalance.toString()).to.equal(tokens('250000000'));
+
+        // token allocation should not be performed more than once
+        await expectRevert(
+            unionProtocolTokenSaleInstance.transferTokensToPredefinedAddresses(),
+            "UPTS_ERROR: token allocation has already been performed"
+        )
     });
 
     it("Should start and end sale properly", async function() {
@@ -347,7 +408,6 @@ describe("UnionProtocolTokenSale", () => {
     it("Should end sale properly", async function() {
 
     });
-
 
     /**
      * TOKEN PURCHASE
@@ -386,42 +446,85 @@ describe("UnionProtocolTokenSale", () => {
     });
 
     it("Should properly calculate total buy price for requested number of tokens", async function() {
-        let buyPrice = await unionProtocolTokenSaleInstance.getBuyPriceInTether(10);
+        let buyPrice = await unionProtocolTokenSaleInstance.getBuyPriceInUSD(10);
+        expect(buyPrice.toString()).to.equal("350000418500010230");
+    });
+
+    it("Should properly calculate total buy price for requested number of tokens in DAI", async function() {
+        // PREREQUISITES
+        await unionProtocolTokenSaleInstance.addSupportedToken(
+            ethers.utils.formatBytes32String("DAI"),
+            daiToken.address,
+            18
+        );
+        // PREQREQUISITES END
+        let buyPrice = await unionProtocolTokenSaleInstance.getBuyPriceInUSD( 10 );
         expect(buyPrice.toString()).to.equal("350000418500010230");
     });
 
     it("Should throw errors when illegal number of tokens are requested to purchase", async function() {
         await expectRevert(
-            unionProtocolTokenSaleInstance.getBuyPriceInTether(0),
+            unionProtocolTokenSaleInstance.getBuyPriceInUSD(0),
             "number of tokens for purchase is below minimum"
         );
         await expectRevert(
-            unionProtocolTokenSaleInstance.getBuyPriceInTether(50000001),
+            unionProtocolTokenSaleInstance.getBuyPriceInUSD(50000001),
             "number of tokens for purchase is above maximum"
         );
     });
 
+    it("Should return maximum integer UNN Token amount for given USD contribution", async function () {
+        const tokenScale = 10 ** 18;
+
+        const contributionInUSD1 = '100000000000000000000';
+        const contributionInUSD2 = '29373000000000000000000';
+        const contributionInUSD3 = '87000000000000000000000';
+
+        const helperUnnTokenAmount1 = (calculateUSDToUNN(contributionInUSD1, 950000001));
+        const helperUnnTokenAmount2 = (calculateUSDToUNN(contributionInUSD2, 950000001));
+        const helperUnnTokenAmount3 = (calculateUSDToUNN(contributionInUSD3, 950000001));
+
+        const smartContractTokenAmount1 = (await unionProtocolTokenSaleInstance.getTokenAmountForUSDContribution(contributionInUSD1)).toString();
+        const smartContractTokenAmount2 = (await unionProtocolTokenSaleInstance.getTokenAmountForUSDContribution(contributionInUSD2)).toString();
+        const smartContractTokenAmount3 = (await unionProtocolTokenSaleInstance.getTokenAmountForUSDContribution(contributionInUSD3)).toString();
+
+        expect(smartContractTokenAmount1.toString()).to.equal(helperUnnTokenAmount1.toString());
+        expect(smartContractTokenAmount2.toString()).to.equal(helperUnnTokenAmount2.toString());
+        expect(smartContractTokenAmount3.toString()).to.equal(helperUnnTokenAmount3.toString());
+    })
+
     /**
      * TOKEN PURCHASE PROCESS
      */
-    it("Should properly buy tokens in public sale", async function() {
-        const numberOfTokensToPurchaseInETH = 10;
-        const bonusTokenFactor = await (unionProtocolTokenSaleInstance.getBonusTokenFactor());
-        const bonusTokensAmount = numberOfTokensToPurchaseInETH * bonusTokenFactor / 100 * 10 ** 18;
+    it("Should properly buy tokens for DAI stablecoin in public sale", async function() {
+        const purchaseUSDAmount = "2000";
+        const stablecoin = {
+            symbol: ethers.utils.formatBytes32String("DAI"),
+            address: daiToken.address,
+            decimals: 18
+        }
+
+        const numberOfIntegerTokensToPurchase = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+        const bonusTokenFactor = await unionProtocolTokenSaleInstance.getBonusTokenFactor();
+        const bonusTokensAmount = new BN(numberOfIntegerTokensToPurchase.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
 
         // PREREQUISITES START
         await unionProtocolTokenSaleInstance.performTokenGeneration();
         await unionProtocolTokenSaleInstance.transferTokensToPredefinedAddresses();
         await unionProtocolTokenSaleInstance.addSupportedToken(
-            ethers.utils.formatBytes32String("DAI"),
-            daiToken.address
+            stablecoin.symbol,
+            stablecoin.address,
+            stablecoin.decimals
         );
         await unionProtocolTokenSaleInstance.startSale();
         await unionProtocolTokenSaleInstance.addToPermittedList(
             publicUser1.address,
             true,
             true,
-            numberOfTokensToPurchaseInETH
+            1000000
         );
         await unnGovernanceToken.connect(ecosystemPartnersTeamWallet).transfer(
             publicSaleBonusWallet.address,
@@ -433,28 +536,247 @@ describe("UnionProtocolTokenSale", () => {
         )
         // PREREQUISITES END
 
-        let buyingPriceInTether = (
-            await unionProtocolTokenSaleInstance.getBuyPriceInTether(numberOfTokensToPurchaseInETH.toString())
+        let buyingPriceInPermittedStableCoin = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfIntegerTokensToPurchase.toString())
         ).toString()
-        await daiToken.approve(unionProtocolTokenSaleInstance.address, buyingPriceInTether);
 
-        // Purchase
+        await daiToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInPermittedStableCoin);
+
+         // Purchase
         await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
-            ethers.utils.formatBytes32String("DAI"),
-            numberOfTokensToPurchaseInETH.toString()
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
         );
-
 
         //check if publicUser1 received tokens
         expect(
             (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
-        ).to.equal(tokens(numberOfTokensToPurchaseInETH.toString()));
+        ).to.equal(tokens(numberOfIntegerTokensToPurchase.toString()));
+        // check if locked balance is correct
         expect(
             (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
         ).to.equal(bonusTokensAmount.toString());
         // check if DAI correctly transfered to sales contribution wallet
         expect(
             (await daiToken.balanceOf(preCheckContributionWallet.address)).toString()
-        ).to.equal(buyingPriceInTether);
+        ).to.equal(buyingPriceInPermittedStableCoin);
+
+        // ------------------------------ 2ND PURCHASE ------------------------------------------
+       const numberOfIntegerTokensToPurchase2 = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+
+        const bonusTokensAmount2 = new BN(numberOfIntegerTokensToPurchase2.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
+
+        let buyingPriceInStableCoin2 = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfIntegerTokensToPurchase2.toString())
+        ).toString()
+       await daiToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInStableCoin2);
+       await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
+        );
+
+        //check if publicUser1 received tokens
+        expect(
+            (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
+        ).to.equal(tokens((numberOfIntegerTokensToPurchase + numberOfIntegerTokensToPurchase2).toString()));
+        // check if locked balance is correct
+        expect(
+            (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
+        ).to.equal(bonusTokensAmount.add(bonusTokensAmount2).toString());
+        // check if DAI correctly transfered to sales contribution wallet
+        expect(
+            (await daiToken.balanceOf(preCheckContributionWallet.address)).toString()
+        ).to.equal((new BN(buyingPriceInPermittedStableCoin).add(new BN(buyingPriceInStableCoin2))).toString());
+
+        // ------------------------------- 3RD PURCHASE ---------------------------------------------
+        const numberOfIntegerTokensToPurchase3 = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+
+        const bonusTokensAmount3 = new BN(numberOfIntegerTokensToPurchase3.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
+
+       let buyingPriceInStableCoin3 = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfIntegerTokensToPurchase3.toString())
+        ).toString()
+       await daiToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInStableCoin3);
+        await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
+        );
+
+        //check if publicUser1 received tokens
+        expect(
+            (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
+        ).to.equal(tokens(
+            (
+                numberOfIntegerTokensToPurchase
+                + numberOfIntegerTokensToPurchase2
+                + numberOfIntegerTokensToPurchase3
+            ).toString()
+        ));
+        // check if locked balance is correct
+        expect(
+            (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
+        ).to.equal(bonusTokensAmount.add(bonusTokensAmount2).add(bonusTokensAmount3).toString());
+        // check if DAI correctly transfered to sales contribution wallet
+        expect(
+            (await daiToken.balanceOf(preCheckContributionWallet.address)).toString()
+        ).to.equal((
+            new BN(buyingPriceInPermittedStableCoin).add(new BN(buyingPriceInStableCoin2)).add(new BN(buyingPriceInStableCoin3))
+        ).toString());
+    });
+
+    it("Should properly buy tokens for USDT stablecoin in public sale", async function() {
+        const purchaseUSDAmount = "2000";
+        const stablecoin = {
+            symbol: ethers.utils.formatBytes32String("USDT"),
+            address: usdtToken.address,
+            decimals: 6
+        }
+
+        const numberOfTokensToPurchaseInETH = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+        const bonusTokenFactor = await unionProtocolTokenSaleInstance.getBonusTokenFactor();
+        const bonusTokensAmount = new BN(numberOfTokensToPurchaseInETH.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
+
+        // PREREQUISITES START
+        await unionProtocolTokenSaleInstance.performTokenGeneration();
+        await unionProtocolTokenSaleInstance.transferTokensToPredefinedAddresses();
+        await unionProtocolTokenSaleInstance.addSupportedToken(
+            stablecoin.symbol,
+            stablecoin.address,
+            stablecoin.decimals
+        );
+        await unionProtocolTokenSaleInstance.startSale();
+        await unionProtocolTokenSaleInstance.addToPermittedList(
+            publicUser1.address,
+            true,
+            false,
+            1000000
+        );
+        await unnGovernanceToken.connect(ecosystemPartnersTeamWallet).transfer(
+            publicSaleBonusWallet.address,
+            tokens("50000000")
+        )
+        await unnGovernanceToken.connect(publicSaleBonusWallet).approve(
+            unionProtocolTokenSaleInstance.address,
+            (await unnGovernanceToken.balanceOf(publicSaleBonusWallet.address)).toString()
+        )
+        // PREREQUISITES END
+
+        let buyingPriceInUSD = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInUSD(numberOfTokensToPurchaseInETH.toString())
+        ).toString();
+        let buyingPriceInStableCoin = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfTokensToPurchaseInETH.toString())
+        ).toString();
+
+        await usdtToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInStableCoin);
+
+         // Purchase
+        await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
+        );
+
+        //check if publicUser1 received tokens
+        expect(
+            (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
+        ).to.equal(tokens(numberOfTokensToPurchaseInETH.toString()));
+        // check if locked balance is correct
+        expect(
+            (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
+        ).to.equal(bonusTokensAmount.toString());
+        // check if DAI correctly transfered to sales contribution wallet
+        expect(
+            (await usdtToken.balanceOf(saleContributionWallet.address)).toString()
+        ).to.equal(buyingPriceInStableCoin);
+
+        // ------------------------------ 2ND PURCHASE ------------------------------------------
+       const numberOfIntegerTokensToPurchase2 = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+
+        const bonusTokensAmount2 = new BN(numberOfIntegerTokensToPurchase2.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
+
+        let buyingPriceInStableCoin2 = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfIntegerTokensToPurchase2.toString()
+            )).toString()
+       await usdtToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInStableCoin2);
+       await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
+        );
+
+        //check if publicUser1 received tokens
+        expect(
+            (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
+        ).to.equal(tokens((numberOfTokensToPurchaseInETH + numberOfIntegerTokensToPurchase2).toString()));
+        // check if locked balance is correct
+        expect(
+            (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
+        ).to.equal(bonusTokensAmount.add(bonusTokensAmount2).toString());
+        // check if DAI correctly transfered to sales contribution wallet
+        expect(
+            (await usdtToken.balanceOf(saleContributionWallet.address)).toString()
+        ).to.equal((new BN(buyingPriceInStableCoin).add(new BN(buyingPriceInStableCoin2))).toString());
+
+
+        // ------------------------------- 3RD PURCHASE ---------------------------------------------
+        const numberOfIntegerTokensToPurchase3 = calculateUSDToUNN(
+            tokens(purchaseUSDAmount),
+            await unionProtocolTokenSaleInstance.getCurrentTokenNumber()
+        );
+
+        const bonusTokensAmount3 = new BN(numberOfIntegerTokensToPurchase3.toString()).mul(new BN(bonusTokenFactor.toString())).mul(new BN((10 ** 18).toString()).div(new BN("100")));
+
+       let buyingPriceInStableCoin3 = (
+            await unionProtocolTokenSaleInstance.getBuyPriceInPermittedStablecoin(
+                stablecoin.symbol,
+                numberOfIntegerTokensToPurchase3.toString())
+        ).toString()
+       await usdtToken.connect(publicUser1).approve(unionProtocolTokenSaleInstance.address, buyingPriceInStableCoin3);
+        await unionProtocolTokenSaleInstance.connect(publicUser1).purchaseTokens(
+            stablecoin.symbol,
+            tokens(purchaseUSDAmount)
+        );
+
+        //check if publicUser1 received tokens
+        expect(
+            (await unnGovernanceToken.balanceOf(publicUser1.address)).toString()
+        ).to.equal(tokens(
+            (
+                numberOfTokensToPurchaseInETH
+                + numberOfIntegerTokensToPurchase2
+                + numberOfIntegerTokensToPurchase3
+            ).toString()
+        ));
+        // check if locked balance is correct
+        expect(
+            (await unnGovernanceToken.lockedBalanceOf(publicUser1.address)).toString()
+        ).to.equal(bonusTokensAmount.add(bonusTokensAmount2).add(bonusTokensAmount3).toString());
+        // check if DAI correctly transfered to sales contribution wallet
+        expect(
+            (await usdtToken.balanceOf(saleContributionWallet.address)).toString()
+        ).to.equal((
+            new BN(buyingPriceInStableCoin).add(new BN(buyingPriceInStableCoin2)).add(new BN(buyingPriceInStableCoin3))
+        ).toString());
     });
 });

@@ -1,7 +1,7 @@
 // Copyright (c) 2020 The UNION Protocol Foundation
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.6.0;
+pragma solidity 0.6.12;
 
 import "hardhat/console.sol";
 
@@ -17,20 +17,28 @@ import { DateTime } from "./util/DateTime.sol";
  * @title UNION Protocol Token Sale Contract
  */
 contract UnionProtocolTokenSale is Context, AccessControl {
-  
+
   using Address for address;
   using SafeMath for uint256;
 
-  UnionGovernanceToken public unnGovernanceToken;
+  address private immutable unnGovernanceTokenAddress;
 
   bytes32 public constant ROLE_ADMIN = DEFAULT_ADMIN_ROLE; // default admin role from AccessControl
   bytes32 public constant ROLE_GOVERN = keccak256("ROLE_GOVERN");
   bytes32 public constant ROLE_MINT = keccak256("ROLE_MINT");
 
   address private constant BURN_ADDRESS = address(0);
-  address public UPTO_CONTRACT_ADDRESS;
 
-  address private a_owner;
+  // These values are needed for calculation of token price where price is the function of token number x:
+  // price(x) = uint256_tokenPriceFormulaSlope * x - uint256_tokenPriceFormulaIntercept
+  uint256 private constant uint256_tokenPriceFormulaSlope = 9300000186;
+  uint256 private constant uint256_tokenPriceFormulaIntercept = 8800000186000000000;
+
+  address private immutable a_owner;
+
+  // minimum and maximum USD contribution that buyer can make
+  uint256 private constant MIN_PURCHASE_USD = 100;
+  uint256 private constant MAX_PURCHASE_USD = 87000;
 
   //contract wallet addresses
   address private a_seedRoundAddress;
@@ -43,19 +51,18 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   address private a_marketLiquidityPoolAddress;
   address private a_supplyReservePoolAddress;
 
-  
+
   bool private b_saleStarted = false;
   bool private b_tokenGenerationPerformed = false;
-  uint256 private uint256_tokenSupplyScale = 10**18;
-  mapping(address => PermittedAccount) m_permittedAccounts;
-  mapping(address => uint256) private m_saleWalletBalances;
-  address private a_precheckContributionWallet;
-  address private a_saleContributionWallet;
+  bool private b_tokenAllocationPerformed = false;
+  uint256 private constant uint256_tokenSupplyScale = 10**18;
+  address private immutable a_precheckContributionWallet;
+  address private immutable a_saleContributionWallet;
   uint256 private uint256_currentTokenNumber = 950000001;
-  uint256 private uint256_publicSaleFirstTokenNumber = 950000001;
-  uint256 private uint256_publicSaleLastTokenNumber = 1000000000;
-  uint256 private uint256_minNumberOfTokensToBePurchasedInETH = 1;
-  uint256 private uint256_maxNumberOfTokensToBePurchasedInETH = 50000000;
+  uint256 private constant uint256_publicSaleFirstTokenNumber = 950000001;
+  uint256 private constant uint256_publicSaleLastTokenNumber = 1000000000;
+  uint256 private uint256_minNumberOfIntegerTokensToBePurchased = 1;
+  uint256 private uint256_maxNumberOfIntegerTokensToBePurchased = 50000000;
 
   //token sale lock parameters
   uint256 private uint256_bonusTokenFactor = 20;
@@ -69,10 +76,17 @@ contract UnionProtocolTokenSale is Context, AccessControl {
    * @member amount
    */
   struct PermittedAccount {
-    address permittedAddress;
     bool isApproved;
     bool isPrecheck;
     uint256 amount;
+  }
+
+  /**
+  * @notice Struct for storing allowed stablecoin tokens
+  */
+  struct PermittedToken {
+    address tokenAddress;
+    uint256 tokenDecimals;
   }
 
   /**
@@ -107,17 +121,41 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   /**
    * @dev mapping of supported tokens for receipt
    */
-  mapping(bytes32 => address) public m_supportedTokens;
+  mapping(bytes32 => PermittedToken) public m_permittedStablecoins;
+
+  /**
+   * @dev mapping of accounts permitted to purchase
+   */
+  mapping(address => PermittedAccount) private m_permittedAccounts;
+
+  /**
+   * @dev mapping of initial balances of wallets needed for preallocation
+   */
+  mapping(address => uint256) private m_saleWalletBalances;
+
+  /**
+   * @dev mapping containing user's total contribution during sale process
+   */
+  mapping(address => uint256) private m_purchasedTokensInUsd;
 
 
   /**
  * @dev constructor
- * @param _unnGovernanceToken Union Governance Token address
+ * @param _unnGovernanceTokenAddress Union Governance Token address
  * @param _precheckContributionWallet wallet for funds received from participants who have been prechecked
  * @param _saleContributionWallet wallet for funds received from participants who KYC during sale
+ * @param _seedWallet seed wallet
+ * @param _privateSale1Wallet private sale 1 wallet
+ * @param _privateSale2Wallet private sale 2 wallet
+ * @param _publicSaleWallet public sale wallet
+ * @param _publicSaleBonusWallet public sale bonus wallet
+ * @param _ecosystemPartnersTeamWallet ecosystem, partners, team wallet
+ * @param _miningIncentivesWallet mining incentives wallet
+ * @param _marketLiquidityWallet market liquidity wallet
+ * @param _supplyReservePoolWallet supply reserve pool wallet
  */
   constructor(
-    UnionGovernanceToken _unnGovernanceToken,
+    address _unnGovernanceTokenAddress,
     address _precheckContributionWallet,
     address _saleContributionWallet,
     address _seedWallet,
@@ -130,10 +168,9 @@ contract UnionProtocolTokenSale is Context, AccessControl {
     address _marketLiquidityWallet,
     address _supplyReservePoolWallet
   ) public {
-    UPTO_CONTRACT_ADDRESS = address(this);
     a_owner = _msgSender();
     _setupRole(ROLE_ADMIN, _msgSender());
-    unnGovernanceToken = _unnGovernanceToken;
+    unnGovernanceTokenAddress = _unnGovernanceTokenAddress;
     // wallets setup
     a_precheckContributionWallet = _precheckContributionWallet;
     a_saleContributionWallet = _saleContributionWallet;
@@ -156,14 +193,29 @@ contract UnionProtocolTokenSale is Context, AccessControl {
    * @param _tokenSymbol symbol of token supported as identifier in mapping
    * @param _tokenAddress address of token supported as value in mapping
    */
-  function addSupportedToken(bytes32 _tokenSymbol, address _tokenAddress) public {
+  function addSupportedToken(bytes32 _tokenSymbol, address _tokenAddress, uint256 _decimals) public {
     require(
-      hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      hasRole(ROLE_ADMIN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_tokenAddress != BURN_ADDRESS);
+    require(
+      _tokenAddress != BURN_ADDRESS,
+      "UPTS_ERROR: given address not allowed to be address zero"
+    );
+    require(
+      _decimals > 0 && _decimals <= 18,
+      "UPTS_ERROR: wrong number of decimals provided. Should be >0 and <=18"
+    );
+    require(
+      getSupportedTokenAddress(_tokenSymbol) == BURN_ADDRESS
+      && getSupportedTokenDecimals(_tokenSymbol) == 0,
+      "UPTS_ERROR: Token already exists. Remove it before modifying"
+    );
 
-    m_supportedTokens[_tokenSymbol] = _tokenAddress; 
+    PermittedToken storage permittedToken = m_permittedStablecoins[_tokenSymbol];
+    permittedToken.tokenAddress = _tokenAddress;
+    permittedToken.tokenDecimals = _decimals;
+    m_permittedStablecoins[_tokenSymbol] = permittedToken;
   }
 
   /**
@@ -173,18 +225,27 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function removeSupportedToken(bytes32 _tokenSymbol) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    delete(m_supportedTokens[_tokenSymbol]);
+    delete(m_permittedStablecoins[_tokenSymbol]);
   }
 
-  
+
   /**
    * @dev get the address for a supported, given token symbol
    * @param _tokenSymbol symbol of token address being queried
    */
   function getSupportedTokenAddress(bytes32 _tokenSymbol) public view returns (address) {
-    return m_supportedTokens[_tokenSymbol];
+    return m_permittedStablecoins[_tokenSymbol].tokenAddress;
+  }
+
+  /**
+   * @dev get the decimal number for a supported, given token symbol
+   * @param _tokenSymbol symbol of token address being queried
+   */
+  function getSupportedTokenDecimals(bytes32 _tokenSymbol) public view returns (uint256) {
+    return m_permittedStablecoins[_tokenSymbol].tokenDecimals;
   }
 
   /**
@@ -194,9 +255,13 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setBonusTokenFactor(uint256 _newFactor) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_newFactor >= 1 && _newFactor <= 500, "UPTS_ERROR: illegal bonus token factor value");
+    require(
+      _newFactor >= 1 && _newFactor <= 500,
+      "UPTS_ERROR: illegal bonus token factor value"
+    );
 
     uint256_bonusTokenFactor = _newFactor;
     emit BonusTokenFactorChanged(_newFactor);
@@ -216,7 +281,8 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setBonusTokenLockPeriod(uint256 _newPeriod) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
     require(_newPeriod >= 1 && _newPeriod <= 60, "UPTS_ERROR: illegal lock period value");
 
@@ -238,11 +304,11 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function addToPermittedList(address _address, bool _isApproved, bool _isPrecheck, uint256 _amount) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     PermittedAccount storage account = m_permittedAccounts[_address];
-    account.permittedAddress = _address;
     account.isApproved = _isApproved;
     account.isPrecheck = _isPrecheck;
     account.amount = _amount;
@@ -292,10 +358,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function removeFromPermittedList(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
-    require(m_permittedAccounts[_address].permittedAddress != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
 
     delete(m_permittedAccounts[_address]);
   }
@@ -304,7 +370,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   * @dev configure wallet preallocation
   */
   function performTokenGeneration() public {
-    require(hasRole(ROLE_ADMIN, _msgSender()));
+    require(
+      hasRole(ROLE_ADMIN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
+    );
     require(
       a_seedRoundAddress != BURN_ADDRESS &&
       a_privateRound1Address != BURN_ADDRESS &&
@@ -313,9 +382,13 @@ contract UnionProtocolTokenSale is Context, AccessControl {
       a_ecosystemPartnersTeamAddress != BURN_ADDRESS &&
       a_miningIncentivesPoolAddress != BURN_ADDRESS &&
       a_marketLiquidityPoolAddress != BURN_ADDRESS &&
-      a_supplyReservePoolAddress != BURN_ADDRESS
+      a_supplyReservePoolAddress != BURN_ADDRESS,
+        "UPTS_ERROR: token generation failed because one of the preallocation wallets address is set to address zero"
     );
-    require(!isTokenGenerationPerformed());
+    require(
+      !isTokenGenerationPerformed(),
+      "UPTS_ERROR: token generation has already been performed"
+    );
 
     m_saleWalletBalances[a_ecosystemPartnersTeamAddress] = 100000000 * uint256_tokenSupplyScale; // * uint256_tokenSupplyScale;
     m_saleWalletBalances[a_miningIncentivesPoolAddress] =  150000000 * uint256_tokenSupplyScale; // * uint256_tokenSupplyScale;
@@ -326,18 +399,6 @@ contract UnionProtocolTokenSale is Context, AccessControl {
     m_saleWalletBalances[a_privateRound2Address] = 50000000 * uint256_tokenSupplyScale; // * uint256_tokenSupplyScale;
     m_saleWalletBalances[a_publicSaleAddress] =    50000000 * uint256_tokenSupplyScale; // * uint256_tokenSupplyScale;
 
-    uint256 initialSupply = 
-      m_saleWalletBalances[a_ecosystemPartnersTeamAddress] +
-      m_saleWalletBalances[a_miningIncentivesPoolAddress]  +
-      m_saleWalletBalances[a_marketLiquidityPoolAddress]   +
-      m_saleWalletBalances[a_supplyReservePoolAddress]     +
-      m_saleWalletBalances[a_seedRoundAddress]             +
-      m_saleWalletBalances[a_privateRound1Address]         +
-      m_saleWalletBalances[a_privateRound2Address]         +
-      m_saleWalletBalances[a_publicSaleAddress];
-
-    require(initialSupply == 1000000000 * 10 ** 18);
-
     b_tokenGenerationPerformed = true;
     emit UnionProtocolTokenSaleTokenGenerationComplete(true);
   }
@@ -346,13 +407,20 @@ contract UnionProtocolTokenSale is Context, AccessControl {
     return b_tokenGenerationPerformed;
   }
 
+  function isTokenAllocationPerformed() public view returns (bool) {
+    return b_tokenAllocationPerformed;
+  }
+
 
   /**
    * @dev Transfers tokens to predefined addresses
    */
   function transferTokensToPredefinedAddresses() public {
-    require(hasRole(ROLE_ADMIN, _msgSender()));
+    require(hasRole(ROLE_ADMIN, _msgSender()), "UPTS_ERROR: operation not allowed for current user");
     require(isTokenGenerationPerformed(), "UPTS_ERROR: token generation has not been performed");
+    require(!isTokenAllocationPerformed(), "UPTS_ERROR: token allocation has already been performed");
+
+    UnionGovernanceToken unnGovernanceToken = getGovernanceToken();
 
     unnGovernanceToken.transferFrom(
       a_owner,
@@ -408,13 +476,15 @@ contract UnionProtocolTokenSale is Context, AccessControl {
       m_saleWalletBalances[a_ecosystemPartnersTeamAddress]
     );
     emit TokenTransferSuccess(address(this), a_ecosystemPartnersTeamAddress, m_saleWalletBalances[a_ecosystemPartnersTeamAddress]);
+
+    b_tokenAllocationPerformed = true;
   }
 
   /**
    * @dev Called by contract owner to start token sale
    */
   function startSale() public {
-    require(hasRole(ROLE_ADMIN, _msgSender()));
+    require(hasRole(ROLE_ADMIN, _msgSender()), "UPTS_ERROR: operation not allowed for current user");
     require(isTokenGenerationPerformed(), "UPTS_ERROR: token generation was not performed");
     require(!isSaleStarted(), "UPTS_ERROR: the sale has already started");
 
@@ -426,7 +496,7 @@ contract UnionProtocolTokenSale is Context, AccessControl {
    * @dev Called by contract owner to end or suspend token sale
    */
   function endSale() public {
-    require(hasRole(ROLE_ADMIN, _msgSender()));
+    require(hasRole(ROLE_ADMIN, _msgSender()), "UPTS_ERROR: operation not allowed for current user");
     require(isTokenGenerationPerformed(), "UPTS_ERROR: token generation was not performed");
     require(isSaleStarted(), "UPTS_ERROR: the sale hasn't started yet");
 
@@ -447,7 +517,7 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function getCurrentTokenNumber() public view returns (uint256) {
     return uint256_currentTokenNumber;
   }
-  
+
   /**
    * @dev Sets seed round wallet address
    * @param _address Address of seed round token wallet
@@ -455,9 +525,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setSeedRoundAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_seedRoundAddress = _address;
   }
 
@@ -467,7 +538,7 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function getSeedRoundAddress()  public view returns (address){
     return a_seedRoundAddress;
   }
-      
+
 
   /**
    * @dev Sets private round 1 wallet address
@@ -476,9 +547,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setPrivateRound1Address(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_privateRound1Address = _address;
   }
 
@@ -497,9 +569,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setPrivateRound2Address(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_privateRound2Address = _address;
   }
 
@@ -518,9 +591,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setPublicSaleAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_publicSaleAddress = _address;
   }
 
@@ -539,9 +613,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setEcosystemPartnersTeamAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_ecosystemPartnersTeamAddress = _address;
   }
 
@@ -552,7 +627,7 @@ contract UnionProtocolTokenSale is Context, AccessControl {
     return a_ecosystemPartnersTeamAddress;
   }
 
-      
+
   /**
    * @dev Sets mining incentives pool wallet address
    * @param _address Address of mining incentives pool token wallet
@@ -560,9 +635,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setMiningIncentivesPoolAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_miningIncentivesPoolAddress = _address;
   }
 
@@ -581,9 +657,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setMarketLiquidityPoolAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_marketLiquidityPoolAddress = _address;
   }
 
@@ -602,9 +679,10 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setSupplyReservePoolAddress(address _address) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_address != BURN_ADDRESS);
+    require(_address != BURN_ADDRESS, "UPTS_ERROR: address cannot be address zero");
     a_supplyReservePoolAddress = _address;
   }
 
@@ -621,11 +699,12 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setMinimumTokenPurchaseAmount(uint256 _amount) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
     require(_amount > 0, "UPTS_ERROR: token amount too small");
-    require(_amount <= uint256_maxNumberOfTokensToBePurchasedInETH, "UPTS_ERROR: token amount cannot exceed maximum token number");
-    uint256_minNumberOfTokensToBePurchasedInETH = _amount;
+    require(_amount <= uint256_maxNumberOfIntegerTokensToBePurchased, "UPTS_ERROR: token amount cannot exceed maximum token number");
+    uint256_minNumberOfIntegerTokensToBePurchased = _amount;
   }
 
   /**
@@ -634,95 +713,158 @@ contract UnionProtocolTokenSale is Context, AccessControl {
   function setMaximumTokenPurchaseAmount(uint256 _amount) public {
     require(
       hasRole(ROLE_ADMIN, _msgSender())
-      || hasRole(ROLE_GOVERN, _msgSender())
+      || hasRole(ROLE_GOVERN, _msgSender()),
+      "UPTS_ERROR: operation not allowed for current user"
     );
-    require(_amount >= uint256_minNumberOfTokensToBePurchasedInETH);
-    uint256_minNumberOfTokensToBePurchasedInETH = _amount;
+    require(_amount >= uint256_minNumberOfIntegerTokensToBePurchased);
+    uint256_maxNumberOfIntegerTokensToBePurchased = _amount;
   }
 
 
   /**
    * @dev calculate the price for a specific token number which is a linear function of the token number
-   * @param _number number (in ETH not Wei) of the token for which the price is being calculated
+   * @param _number number (in whole tokens, not Wei) of the token for which the price is being calculated
    * @return token price for specifed token number
    */
   function getTokenPrice(uint256 _number) public pure returns (uint256) {
-    require(_number >= 950000001 && _number <= 1000000000, "UPTS_ERROR: token number is out of sale bounds");
-    uint256 slope = 9300000186;
-    uint256 intercept = 8800000186000000000;
-    return slope.mul(_number).sub(intercept);
+    require(
+      _number >= uint256_publicSaleFirstTokenNumber && _number <= uint256_publicSaleLastTokenNumber,
+        "UPTS_ERROR: token number is out of sale bounds"
+    );
+
+    return uint256_tokenPriceFormulaSlope.mul(_number).sub(uint256_tokenPriceFormulaIntercept);
   }
 
 
   /**
-   * @dev calculate the price for a specific quantity of tokens
-   * @param _amountInEth number of tokens for which the price is being calculated
-   * @return price for specifed number of tokens
+   * @dev calculate the price in USD for a specific quantity of tokens
+   * @param _integerAmount number of integer tokens for which the price is being calculated
+   * @return price for specified number of tokens
    */
-  function getBuyPriceInTether(uint256 _amountInEth) public view returns (uint256) {
+  function getBuyPriceInUSD(uint256 _integerAmount) public view returns (uint256) {
     require(
-      _amountInEth >= uint256_minNumberOfTokensToBePurchasedInETH,
+      _integerAmount >= uint256_minNumberOfIntegerTokensToBePurchased,
       "UPTS_ERROR: number of tokens for purchase is below minimum"
     );
     require(
-      _amountInEth <= uint256_maxNumberOfTokensToBePurchasedInETH,
+      _integerAmount <= uint256_maxNumberOfIntegerTokensToBePurchased,
       "UPTS_ERROR: number of tokens for purchase is above maximum"
     );
     require(
-      (uint256_currentTokenNumber + _amountInEth) <= uint256_publicSaleLastTokenNumber,
+      (uint256_currentTokenNumber + _integerAmount) <= uint256_publicSaleLastTokenNumber,
       "UPTS_ERROR: number of tokens to buy exceeds the sale pool"
     );
 
-    uint256 lastTokenPrice = getTokenPrice(_amountInEth.add(uint256_currentTokenNumber).sub(1));
+    uint256 lastTokenPrice = getTokenPrice(_integerAmount.add(uint256_currentTokenNumber).sub(1));
     uint256 firstTokenPrice = getTokenPrice(uint256_currentTokenNumber);
     // calculate the sum of arithmetic sequence
-    return(firstTokenPrice.add(lastTokenPrice)).mul(_amountInEth).div(2);
+    return(firstTokenPrice.add(lastTokenPrice)).mul(_integerAmount).div(2);
   }
 
   /**
-  * @dev returns the interface for the tether token required for payments
+  * @dev returns the interface for the stablecoin token required for payments
   */
-  function getERC20Token(address _address) internal pure returns (IERC20) {
+  function getERC20Token(address _address) private pure returns (IERC20) {
     return IERC20(_address);
   }
 
+  /**
+   * @dev returns the governance token instance
+   */
+  function getGovernanceToken() private view returns (UnionGovernanceToken){
+    return UnionGovernanceToken(unnGovernanceTokenAddress);
+  }
+
+  /**
+   * @dev returns value in the given stablecoin
+   */
+  function getBuyPriceInPermittedStablecoin(bytes32 _tokenSymbol, uint256 _amount) public view returns (uint256) {
+    require(
+      getSupportedTokenDecimals(_tokenSymbol) > 0,
+      "UPTS_ERROR: stablecoin token with the given symbol is not allowed"
+    );
+    uint256 usdValue = getBuyPriceInUSD(_amount);
+    if (getSupportedTokenDecimals(_tokenSymbol) < 18) {
+      return usdValue.div(10 ** (18 - getSupportedTokenDecimals(_tokenSymbol)));
+    } else {
+      return usdValue;
+    }
+  }
+
+  /**
+   * @dev helper function for calculating square root
+   */
+  function sqrt(uint y) public pure returns (uint z) {
+    if (y > 3) {
+      z = y;
+      uint x = y / 2 + 1;
+      while (x < z) {
+        z = x;
+        x = (y / x + x) / 2;
+      }
+    } else if (y != 0) {
+      z = 1;
+    }
+  }
+
+  /**
+   * @dev calculates maximum number of integer tokens to be bought for the given USD contribution
+   * @param _USDContribution contribution in USD in Wei
+   */
+  function getTokenAmountForUSDContribution(int256 _USDContribution) public view returns (int256) {
+    int256 int256_currentTokenNumber = int256(uint256_currentTokenNumber);
+    int256 preSqrt = (86490003459600034596 * (int256_currentTokenNumber ** 2)) - (163680006819690072651600034596 * int256_currentTokenNumber) + (18600000372 * _USDContribution) + 77440003355440037984222535460900008649;
+    int256 postSqrt = int256(sqrt(uint256(preSqrt)));
+    int256 result = (postSqrt - (9300000186 * int256_currentTokenNumber) + 8800000190650000093) / 9300000186;
+    return result;
+  }
 
   /**
    * @dev public mechanism for buying tokens from smart contract. It needs the purchaser to previously approve his
    * ERC20 token amount in which he wishes to do payment.
    * Payments in tokens are not currently supported (Look EIP-1958)
+   * @param _contributedTokenSymbol the token symbol in which payment will be performed
+   * @param _contributionInUSD USD contribution in Wei
    */
-function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokensInEth) public {
+  function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _contributionInUSD) public {
     require(isSaleStarted(), "UPTS_ERROR: sale has not started yet");
     require(getAddressPermittedApprovalStatus(_msgSender()), "UPTS_ERROR: user not authorised for purchase");
+
+    uint256 _numberOfIntegerTokens = uint256(getTokenAmountForUSDContribution(int256(_contributionInUSD)));
     require(
-      m_permittedAccounts[_msgSender()].amount >= _numberOfTokensInEth,
-        "UPTS_ERROR: insufficient number of tokens approved for purchase"
+      m_permittedAccounts[_msgSender()].amount >= _numberOfIntegerTokens,
+        "UPTS_ERROR: insufficient number of tokens allowed for user to purchase"
     );
 
     address tokenAddress = getSupportedTokenAddress(_contributedTokenSymbol);
     require(
       tokenAddress != BURN_ADDRESS,
-      "UPTS_ERROR: tether token with the given symbol is not allowed for making payments"
+      "UPTS_ERROR: stablecoin token with the given symbol is not allowed for making payments"
+    );
+
+    IERC20 stablecoinToken = getERC20Token(tokenAddress);
+    uint256 buyPriceInStablecoin = getBuyPriceInPermittedStablecoin(_contributedTokenSymbol, _numberOfIntegerTokens);
+    uint256 buyPriceInUSD = buyPriceInStablecoin.div(10**getSupportedTokenDecimals(_contributedTokenSymbol));
+    require(
+      checkUserPurchaseTokenLimits(_msgSender(), buyPriceInUSD),
+      "UPTS_ERROR: requested amount exceeds purchase limits"
     );
 
     // COLLECTING PAYMENT
-    IERC20 tetherToken = getERC20Token(tokenAddress);
-    uint256 buyPriceInTether = getBuyPriceInTether(_numberOfTokensInEth);
-    bool paymentCollected = _collectPaymentInTetherToken(_msgSender(), tetherToken, buyPriceInTether);
+    bool paymentCollected = _collectPaymentInStablecoin(_msgSender(), stablecoinToken, buyPriceInStablecoin);
     if (!paymentCollected) {
-      revert("error with tether payment");
+      revert("error with stablecoin payment");
     }
 
     // TRANSFER
-    bool tokenTransferSuccess = _transferTokens(_msgSender(), _numberOfTokensInEth);
+    bool tokenTransferSuccess = _transferTokens(_msgSender(), _numberOfIntegerTokens);
     if (!tokenTransferSuccess) {
       revert("error with token transfer");
     }
-    m_permittedAccounts[_msgSender()].amount = m_permittedAccounts[_msgSender()].amount.sub(_numberOfTokensInEth);
+    m_permittedAccounts[_msgSender()].amount = m_permittedAccounts[_msgSender()].amount.sub(_numberOfIntegerTokens);
 
     // BONUS TOKEN TRANSFER
-    uint256 lockedTokenAmount = _calculateBonusTokenAmount(_numberOfTokensInEth);
+    uint256 lockedTokenAmount = _calculateBonusTokenAmount(_numberOfIntegerTokens);
     bool bonusTokenTransferSuccess = _transferLockedTokens(_msgSender(), lockedTokenAmount);
     if (!bonusTokenTransferSuccess) {
       revert("error with bonus token transfer");
@@ -731,35 +873,45 @@ function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokens
     bool success = false;
     if(paymentCollected && tokenTransferSuccess && bonusTokenTransferSuccess) {
       success = true;
+      m_purchasedTokensInUsd[_msgSender()] = m_purchasedTokensInUsd[_msgSender()].add(buyPriceInUSD);
     }
 
     TokenTransferRecord memory record;
     record.transactionTimestamp = now;
     record.tokenRecipient = _msgSender();
     record.tokenReceived = _contributedTokenSymbol;
-    record.tokenAmountReceived = buyPriceInTether;
-    record.amountUNNSent = _numberOfTokensInEth.mul(uint256_tokenSupplyScale);
+    record.tokenAmountReceived = buyPriceInStablecoin;
+    record.amountUNNSent = _numberOfIntegerTokens.mul(uint256_tokenSupplyScale);
     record.amountBonusUNNSent = lockedTokenAmount;
     record.success = success;
 
     l_tokenTransactions.push(record);
 
-    emit TokensPurchased(_msgSender(), _numberOfTokensInEth);
+    emit TokensPurchased(_msgSender(), _numberOfIntegerTokens);
   }
 
   /**
-  * @dev calls a TransferFrom method from the given tether token on the payer
+   * @dev returns if user fits the limits for purchase
+   */
+  function checkUserPurchaseTokenLimits(address _buyer, uint256 _requestedAmountInUsd) public view returns (bool){
+    return !((m_purchasedTokensInUsd[_buyer].add(_requestedAmountInUsd) > MAX_PURCHASE_USD) ||
+      (_requestedAmountInUsd < MIN_PURCHASE_USD.sub(1)));
+  }
+
+  /**
+  * @dev calls a TransferFrom method from the given stableoin token on the payer
   * @param _payer payer address
-  * @param _tetherToken ERC20 instance of payment tether
+  * @param _stablecoinToken ERC20 instance of payment stablecoin
   * @param _amount payment amount
   */
-  function _collectPaymentInTetherToken(address _payer, IERC20 _tetherToken, uint256 _amount) private returns (bool){
+  function _collectPaymentInStablecoin(address _payer, IERC20 _stablecoinToken, uint256 _amount) private returns (bool){
     require(
-      _tetherToken.allowance(_payer, UPTO_CONTRACT_ADDRESS) >= _amount,
+      _stablecoinToken.allowance(_payer, address(this)) >= _amount,
       "UPTS_ERROR: insuficient funds allowed for contract to perform purchase"
     );
+    UnionGovernanceToken unnGovernanceToken = getGovernanceToken();
     require(
-      unnGovernanceToken.allowance(a_publicSaleAddress, UPTO_CONTRACT_ADDRESS) >= _amount,
+      unnGovernanceToken.allowance(a_publicSaleAddress, address(this)) >= _amount,
       "UPTS_ERROR: public sale wallet owner has not allowed requested UNN Token amount"
     );
 
@@ -769,7 +921,7 @@ function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokens
     } else {
       incomingPaymentWallet = a_saleContributionWallet;
     }
-    return _tetherToken.transferFrom(_payer, incomingPaymentWallet, _amount);
+    return _stablecoinToken.transferFrom(_payer, incomingPaymentWallet, _amount);
   }
 
   /**
@@ -778,16 +930,17 @@ function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokens
    */
  function _transferTokens(
      address _recipient,
-     uint256 _amountInEth
+     uint256 _integerAmount
  ) private returns (bool) {
+   UnionGovernanceToken unnGovernanceToken = getGovernanceToken();
     bool success = unnGovernanceToken.transferFrom(
       a_publicSaleAddress,
       _recipient,
-      _amountInEth.mul(uint256_tokenSupplyScale)
+      _integerAmount.mul(uint256_tokenSupplyScale)
     );
-    uint256_currentTokenNumber = uint256_currentTokenNumber.add(_amountInEth);
+    uint256_currentTokenNumber = uint256_currentTokenNumber.add(_integerAmount);
 
-    emit TokenTransferSuccess(a_publicSaleAddress, _recipient, _amountInEth.mul(uint256_tokenSupplyScale));
+    emit TokenTransferSuccess(a_publicSaleAddress, _recipient, _integerAmount.mul(uint256_tokenSupplyScale));
     return success;
   }
 
@@ -798,8 +951,9 @@ function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokens
     address _recipient,
     uint256 _amount
   ) private returns (bool) {
+    UnionGovernanceToken unnGovernanceToken = getGovernanceToken();
     require(
-      unnGovernanceToken.allowance(a_publicSaleBonusAddress, UPTO_CONTRACT_ADDRESS) >= _amount,
+      unnGovernanceToken.allowance(a_publicSaleBonusAddress, address(this)) >= _amount,
       "UPTS_ERROR: public sale bonus tokens wallet owner has not allowed requested UNN Token amount"
     );
     uint256 releaseTime = _calculateReleaseTime();
@@ -846,8 +1000,8 @@ function purchaseTokens(bytes32 _contributedTokenSymbol, uint256 _numberOfTokens
    *   owner.  The sale must be stopped or paused prior to being killed.
    */
   function performContractKill() public {
-    require(hasRole(ROLE_ADMIN, _msgSender()));
-    require(!isSaleStarted());
+    require(hasRole(ROLE_ADMIN, _msgSender()), "UPTS_ERROR: operation not allowed for current user");
+    require(!isSaleStarted(), "UPTS_ERROR: sale is in progress. End the sale before killing contract");
     selfdestruct(_msgSender());
     emit UnionProtocolTokenSaleContractInstalled(false);
   }

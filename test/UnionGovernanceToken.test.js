@@ -612,6 +612,50 @@ describe("UnionGovernanceToken", () => {
       result = await unionGovernanceToken.connect(user2).calculateVotingPower()
       expect(result.toString()).to.equal(tokens('5800'))
     })
+
+    it('Should return size of locked balance array', async () => {
+      let result
+
+      // Send locked non-votable tokens to user1
+      await unionGovernanceToken.transferAndLock(user1.address, tokens('100'), (await getTime()) + 5 * 86400, false)
+
+      // Send locked votable tokens to user1
+      await unionGovernanceToken.transferAndLock(user1.address, tokens('200'), (await getTime()) + 20 * 86400, true)
+
+      result = await unionGovernanceToken.getLockedTokensListSize(user1.address)
+      expect(result.toString()).to.equal('3')
+    })
+
+    it('Should return positions in locked balance array', async () => {
+      let result
+
+      result = await unionGovernanceToken.connect(user1).getLockedTokens(user1.address, 0)
+      expect(result[0]).to.equal(tokens('20000'))
+      expect(result[1].toString()).to.match(/\d*/);
+      expect(result[2]).to.equal(true)
+
+      result = await unionGovernanceToken.getLockedTokens(user1.address, 1)
+      expect(result[0]).to.equal(tokens('100'))
+      expect(result[1].toString()).to.match(/\d*/);
+      expect(result[2]).to.equal(false)
+
+      result = await unionGovernanceToken.getLockedTokens(user1.address, 2)
+      expect(result[0]).to.equal(tokens('200'))
+      expect(result[1].toString()).to.match(/\d*/);
+      expect(result[2]).to.equal(true)
+
+      await expectRevert(
+        unionGovernanceToken.getLockedTokens(user1.address, 3),
+        "UPGT_ERROR: LockedTokens position doesn't exist on given index"
+      )
+    })
+
+    it('Should fail on listing positions in locked balance array as unpermissioned user', async () => {
+      await expectRevert(
+        unionGovernanceToken.connect(user2).getLockedTokens(user1.address, 0),
+        "UPGT_ERROR: insufficient permissions"
+      )
+    })
   })
 
 })

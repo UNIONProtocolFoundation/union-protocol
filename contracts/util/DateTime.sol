@@ -1,7 +1,7 @@
 // Copyright (c) 2020 The UNION Protocol Foundation
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.6.0;
+pragma solidity 0.6.12;
 
 /**
  * @title UNION Protocol date/time utility

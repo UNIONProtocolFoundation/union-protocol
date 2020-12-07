@@ -1,7 +1,7 @@
 // Copyright (c) 2020 The UNION Protocol Foundation
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.6.0;
+pragma solidity 0.6.12;
 pragma experimental ABIEncoderV2;
 
 import "hardhat/console.sol";
@@ -12,8 +12,6 @@ import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/utils/EnumerableSet.sol";
-
-import "./UnnEIP712Lib.sol";
 
 /**
  * @title UNION Protocol Governance Token
@@ -45,6 +43,52 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     uint amount;
     uint releaseTime;
     bool votable;
+  }
+
+  /**
+  * @notice Struct for EIP712 Domain
+  * @member name
+  * @member version
+  * @member chainId
+  * @member verifyingContract
+  * @member salt
+  */
+  struct EIP712Domain {
+    string name;
+    string version;
+    uint256 chainId;
+    address verifyingContract;
+    bytes32 salt;
+  }
+
+  /**
+  * @notice Struct for EIP712 VotingDelegate call
+  * @member owner
+  * @member delegate
+  * @member nonce
+  * @member expirationTime
+  */
+  struct VotingDelegate {
+    address owner;
+    address delegate;
+    uint256 nonce;
+    uint256 expirationTime;
+  }
+
+  /**
+  * @notice Struct for EIP712 Permit call
+  * @member owner
+  * @member spender
+  * @member value
+  * @member nonce
+  * @member deadline
+  */
+  struct Permit {
+    address owner;
+    address spender;
+    uint256 value;
+    uint256 nonce;
+    uint256 deadline;
   }
 
   /**
@@ -91,8 +135,19 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
   bytes32 public constant ROLE_GOVERN = keccak256("ROLE_GOVERN");
   bytes32 public constant ROLE_MINT = keccak256("ROLE_MINT");
   bytes32 public constant ROLE_LOCK = keccak256("ROLE_LOCK");
+  bytes32 public constant ROLE_TRUSTED = keccak256("ROLE_TRUSTED");
   bytes32 public constant ROLE_TEST = keccak256("ROLE_TEST");
    
+  bytes32 public constant EIP712DOMAIN_TYPEHASH = keccak256(
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)"
+  );
+  bytes32 public constant DELEGATE_TYPEHASH = keccak256(
+    "DelegateVote(address owner,address delegate,uint256 nonce,uint256 expirationTime)"
+  );
+
+  //keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+  bytes32 public constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
+
   address private constant BURN_ADDRESS = address(0);
   address public UPGT_CONTRACT_ADDRESS;
 
@@ -130,6 +185,11 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    * @dev Total amount of tokens
    */
   uint256 private uint256_totalSupply;
+
+  /**
+   * @dev Chain id
+   */
+  uint256 private uint256_chain_id;
 
   /**
    * @dev general transfer restricted as function of public sale not complete
@@ -201,6 +261,8 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     _setupRole(ROLE_ADMIN, _msgSender());
     _setupRole(ROLE_ALLOCATE, _owner);
     _setupRole(ROLE_ALLOCATE, _msgSender());
+    _setupRole(ROLE_TRUSTED, _owner);
+    _setupRole(ROLE_TRUSTED, _msgSender());
     _setupRole(ROLE_GOVERN, _owner);
     _setupRole(ROLE_MINT, _owner);
     _setupRole(ROLE_LOCK, _owner);
@@ -209,11 +271,12 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     m_balances[_owner] = _initialSupply;
     uint256_totalSupply = _initialSupply;
     b_canTransfer = false;
+    uint256_chain_id = _getChainId();
 
-    EIP712DOMAIN_SEPARATOR = UnnEIP712Lib._hash(UnnEIP712Lib.EIP712Domain({
+    EIP712DOMAIN_SEPARATOR = _hash(EIP712Domain({
         name : name,
         version : version,
-        chainId : _getChainId(),
+        chainId : uint256_chain_id,
         verifyingContract : address(this),
         salt : keccak256(abi.encodePacked(name))
       }
@@ -317,6 +380,31 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
   }
 
   /**
+   * @dev Retrieve lenght of locked balance array for specific address
+   * @param _account address of account holding locked balance
+   * @return uint256 locked balance array lenght
+   */
+  function getLockedTokensListSize(address _account) public view returns (uint256){
+    require(_msgSender() == _account || hasRole(ROLE_ADMIN, _msgSender()) || hasRole(ROLE_TRUSTED, _msgSender()), "UPGT_ERROR: insufficient permissions");
+    return m_lockedBalances[_account].length;
+  }
+
+  /**
+   * @dev Retrieve locked tokens struct from locked balance array for specific address
+   * @param _account address of account holding locked tokens
+   * @param _index index in array with locked tokens position
+   * @return amount of locked tokens
+   * @return releaseTime descibes time when tokens will be unlocked
+   * @return votable flag is describing votability of tokens
+   */
+  function getLockedTokens(address _account, uint256 _index) public view returns (uint256 amount, uint256 releaseTime, bool votable){
+    require(_msgSender() == _account || hasRole(ROLE_ADMIN, _msgSender()) || hasRole(ROLE_TRUSTED, _msgSender()), "UPGT_ERROR: insufficient permissions");
+    require(_index < m_lockedBalances[_account].length, "UPGT_ERROR: LockedTokens position doesn't exist on given index");
+    LockedTokens storage lockedTokens = m_lockedBalances[_account][_index];
+    return (lockedTokens.amount, lockedTokens.releaseTime, lockedTokens.votable);
+  }
+
+  /**
    * @dev Calculates locked balance of a specified account
    * @param _account address of account holding locked balance
    * @return uint256 locked balance of the specified account address
@@ -340,7 +428,7 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     uint256 releasedBalance = 0;
     for (uint i=0; i<m_lockedBalances[_account].length; i++) {
       if(m_lockedBalances[_account][i].releaseTime <= block.timestamp){
-          releasedBalance += m_lockedBalances[_account][i].amount;
+          releasedBalance = releasedBalance.add(m_lockedBalances[_account][i].amount);
       }
     }
     return releasedBalance;
@@ -369,7 +457,7 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     uint256 releasedToMove = 0;
     for (uint i=0; i<m_lockedBalances[_account].length; i++) {
       if(m_lockedBalances[_account][i].releaseTime <= block.timestamp){
-        releasedToMove += m_lockedBalances[_account][i].amount;
+        releasedToMove = releasedToMove.add(m_lockedBalances[_account][i].amount);
         m_lockedBalances[_account][i] = m_lockedBalances[_account][m_lockedBalances[_account].length - 1];
         m_lockedBalances[_account].pop();
       }
@@ -419,7 +507,7 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     bool retval = false;
     if(_spender != BURN_ADDRESS &&
       _spender != UPGT_CONTRACT_ADDRESS &&
-      m_allowances[_owner][_spender] == 0
+      (m_allowances[_owner][_spender] == 0 || _value == 0)
     ){
       m_allowances[_owner][_spender] = _value;
       emit Approval(_owner, _spender, _value);
@@ -526,7 +614,7 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    */
   function removeEligibleLockedDestination(address _address) public {
     if(hasRole(ROLE_ADMIN, _msgSender())){
-      require(_address != BURN_ADDRESS);
+      require(_address != BURN_ADDRESS, "UPGT_ERROR: address cannot be burn address");
       delete(m_lockedDestinations[_address]);
     }
   }
@@ -669,7 +757,7 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
         m_lockedBalances[_to].push(LockedTokens(_value, _releaseTime, _votable));
         retval = true;
         //need to move voting delegates with transfer of tokens
-        retval = retval && _moveVotingDelegates(m_delegatedAccounts[_owner], m_delegatedAccounts[_to], _value);  
+        // retval = retval && _moveVotingDelegates(m_delegatedAccounts[_owner], m_delegatedAccounts[_to], _value);  
         emit Transfer(_owner, _to, _value);
       }
     }
@@ -706,10 +794,11 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
       if(
         _spender != BURN_ADDRESS &&
         _spender != UPGT_CONTRACT_ADDRESS &&
-        (m_balances[_owner] >= _value) &&
-        (m_balances[_spender].add(_value) >= m_balances[_spender]) &&
+        (balanceOf(_owner) >= _value) &&
+        (_value > 0) &&
         (m_allowances[_owner][_msgSender()] >= _value)
       ){
+        _moveReleasedBalance(_owner);
         m_balances[_owner] = m_balances[_owner].sub(_value);
         m_balances[_spender] = m_balances[_spender].add(_value);
         m_allowances[_owner][_msgSender()] = m_allowances[_owner][_msgSender()].sub(_value);
@@ -759,15 +848,17 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
       if(
         _to != BURN_ADDRESS &&
         _to != UPGT_CONTRACT_ADDRESS &&
-        (m_balances[_owner] >= _value) &&
+        (balanceOf(_owner) >= _value) &&
+        (_value > 0) &&
         (m_allowances[_owner][_msgSender()] >= _value)
       ){
+        _moveReleasedBalance(_owner);
         m_balances[_owner] = m_balances[_owner].sub(_value);
         m_lockedBalances[_to].push(LockedTokens(_value, _releaseTime, _votable));
         m_allowances[_owner][_msgSender()] = m_allowances[_owner][_msgSender()].sub(_value);
         retval = true;
         //need to move delegates that exist for this owner in line with transfer
-        retval = retval && _moveVotingDelegates(_owner, _to, _value); 
+        // retval = retval && _moveVotingDelegates(_owner, _to, _value); 
         emit Transfer(_owner, _to, _value);
       }
     }
@@ -1048,38 +1139,31 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    * @param _owner address of token owner
    * @param _spender address of designated spender
    * @param _value value permitted for spend
-   * @param _expiretimestamp expiration of signature
+   * @param _deadline expiration of signature
    * @param _ecv ECDSA v parameter
    * @param _ecr ECDSA r parameter
    * @param _ecs ECDSA s parameter
    */
-  function permitAllocationBySignature(
+  function permit(
     address _owner, 
     address _spender, 
     uint256 _value, 
-    uint256 _expiretimestamp, 
+    uint256 _deadline, 
     uint8 _ecv, 
     bytes32 _ecr, 
     bytes32 _ecs
   ) external returns (bool) {
-    require(block.timestamp <= _expiretimestamp);
-    m_nonces[_owner] = m_nonces[_owner].add(1);
+    require(block.timestamp <= _deadline, "UPGT_ERROR: wrong timestamp");
+    require(uint256_chain_id == _getChainId(), "UPGT_ERROR: chain_id is incorrect");
     bytes32 digest = keccak256(abi.encodePacked(
         "\x19\x01",
         EIP712DOMAIN_SEPARATOR,
-        UnnEIP712Lib._hash(UnnEIP712Lib.Permit(
-          {
-            owner : _owner,
-            spender : _spender,
-            value : _value,
-            nonce : m_nonces[_owner],
-            expirationTime : _expiretimestamp  
-          })
-        )
+        keccak256(abi.encode(PERMIT_TYPEHASH, _owner, _spender, _value, m_nonces[_owner]++, _deadline))
       )
     );
-    require(_owner == UnnEIP712Lib._recoverSigner(digest, _ecv, _ecr, _ecs));
-    require(_owner != BURN_ADDRESS);
+    require(_owner == _recoverSigner(digest, _ecv, _ecr, _ecs), "UPGT_ERROR: sign does not match user");
+    require(_owner != BURN_ADDRESS, "UPGT_ERROR: address cannot be burn address");
+
     return _approveUNN(_owner, _spender, _value);
   }
 
@@ -1101,23 +1185,24 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
     bytes32 _ecr, 
     bytes32 _ecs
   ) external returns (bool) {
-    require(block.timestamp <= _expiretimestamp);
-    m_nonces[_owner] = m_nonces[_owner].add(1);
+    require(block.timestamp <= _expiretimestamp, "UPGT_ERROR: wrong timestamp");
+    require(uint256_chain_id == _getChainId(), "UPGT_ERROR: chain_id is incorrect");
     bytes32 digest = keccak256(abi.encodePacked(
         "\x19\x01",
         EIP712DOMAIN_SEPARATOR,
-        UnnEIP712Lib._hash(UnnEIP712Lib.VotingDelegate(
+        _hash(VotingDelegate(
           {
             owner : _owner,
             delegate : _delegate,
-            nonce : m_nonces[_owner],
+            nonce : m_nonces[_owner]++,
             expirationTime : _expiretimestamp
           })
         )
       )
     );
-    require(_owner == UnnEIP712Lib._recoverSigner(digest, _ecv, _ecr, _ecs));
-    require(_owner!= BURN_ADDRESS);
+    require(_owner == _recoverSigner(digest, _ecv, _ecr, _ecs), "UPGT_ERROR: sign does not match user");
+    require(_owner!= BURN_ADDRESS, "UPGT_ERROR: address cannot be burn address");
+
     return _delegateVote(_owner, _delegate);
   }
 
@@ -1127,9 +1212,9 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    * @return bytes32 hash of _eip712Domain
    * Requires ROLE_TEST
    */
-  function hashEIP712Domain(UnnEIP712Lib.EIP712Domain memory _eip712Domain) public view returns (bytes32) {
+  function hashEIP712Domain(EIP712Domain memory _eip712Domain) public view returns (bytes32) {
     require(hasRole(ROLE_TEST, _msgSender()), "UPGT_ERROR: ROLE_TEST Required");
-    return UnnEIP712Lib._hash(_eip712Domain);
+    return _hash(_eip712Domain);
   }
 
   /**
@@ -1138,9 +1223,9 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    * @return bytes32 hash of _delegate
    * Requires ROLE_TEST
    */
-  function hashDelegate(UnnEIP712Lib.VotingDelegate memory _delegate) public view returns (bytes32) {
+  function hashDelegate(VotingDelegate memory _delegate) public view returns (bytes32) {
     require(hasRole(ROLE_TEST, _msgSender()), "UPGT_ERROR: ROLE_TEST Required");
-    return UnnEIP712Lib._hash(_delegate);
+    return _hash(_delegate);
   }
 
   /**
@@ -1149,9 +1234,9 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    * @return bytes32 hash of _permit
    * Requires ROLE_TEST
    */
-  function hashPermit(UnnEIP712Lib.Permit memory _permit) public view returns (bytes32) {
+  function hashPermit(Permit memory _permit) public view returns (bytes32) {
     require(hasRole(ROLE_TEST, _msgSender()), "UPGT_ERROR: ROLE_TEST Required");
-    return UnnEIP712Lib._hash(_permit);
+    return _hash(_permit);
   }
 
   /**
@@ -1165,7 +1250,91 @@ contract UnionGovernanceToken is AccessControl, IERC20 {
    */
   function recoverSigner(bytes32 _digest, uint8 _ecv, bytes32 _ecr, bytes32 _ecs) public view returns (address) {
     require(hasRole(ROLE_TEST, _msgSender()), "UPGT_ERROR: ROLE_TEST Required");
-    return UnnEIP712Lib._recoverSigner(_digest, _ecv, _ecr, _ecs);
+    return _recoverSigner(_digest, _ecv, _ecr, _ecs);
   }
 
+  /**
+  * @dev Private hash EIP712Domain struct for EIP-712
+  * @param _eip712Domain EIP712Domain struct
+  * @return bytes32 hash of _eip712Domain
+  */
+  function _hash(EIP712Domain memory _eip712Domain) internal pure returns (bytes32) {
+      return keccak256(
+          abi.encode(
+              EIP712DOMAIN_TYPEHASH,
+              keccak256(bytes(_eip712Domain.name)),
+              keccak256(bytes(_eip712Domain.version)),
+              _eip712Domain.chainId,
+              _eip712Domain.verifyingContract,
+              _eip712Domain.salt
+          )
+      );
+  }
+
+  /**
+  * @dev Private hash Delegate struct for EIP-712
+  * @param _delegate VotingDelegate struct
+  * @return bytes32 hash of _delegate
+  */
+  function _hash(VotingDelegate memory _delegate) internal pure returns (bytes32) {
+      return keccak256(
+          abi.encode(
+              DELEGATE_TYPEHASH,
+              _delegate.owner,
+              _delegate.delegate,
+              _delegate.nonce,
+              _delegate.expirationTime
+          )
+      );
+  }
+
+  /** 
+  * @dev Private hash Permit struct for EIP-712
+  * @param _permit Permit struct
+  * @return bytes32 hash of _permit
+  */
+  function _hash(Permit memory _permit) internal pure returns (bytes32) {
+      return keccak256(abi.encode(
+      PERMIT_TYPEHASH,
+      _permit.owner,
+      _permit.spender,
+      _permit.value,
+      _permit.nonce,
+      _permit.deadline
+      ));
+  }
+
+  /**
+  * @dev Recover signer information from provided digest
+  * @param _digest signed, hashed message
+  * @param _ecv ECDSA v parameter
+  * @param _ecr ECDSA r parameter
+  * @param _ecs ECDSA s parameter
+  * @return address of the validated signer
+  * based on openzeppelin/contracts/cryptography/ECDSA.sol recover() function
+  */
+  function _recoverSigner(bytes32 _digest, uint8 _ecv, bytes32 _ecr, bytes32 _ecs) internal pure returns (address) {
+      // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+      // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+      // the valid range for s in (281): 0 < s < secp256k1n ÷ 2 + 1, and for v in (282): v ∈ {27, 28}. Most
+      // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+      //
+      // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+      // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+      // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+      // these malleable signatures as well.
+      if(uint256(_ecs) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+          revert("ECDSA: invalid signature 's' value");
+      }
+
+      if(_ecv != 27 && _ecv != 28) {
+          revert("ECDSA: invalid signature 'v' value");
+      }
+
+      // If the signature is valid (and not malleable), return the signer address
+      address signer = ecrecover(_digest, _ecv, _ecr, _ecs);
+      require(signer != BURN_ADDRESS, "ECDSA: invalid signature");
+
+      return signer;
+  }
 }

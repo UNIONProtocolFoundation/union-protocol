@@ -14,22 +14,29 @@ task("accounts", "Prints the list of accounts", async () => {
  */
 module.exports = {
   solidity: {
-    version: "0.6.12",
-    settings: {
-      optimizer: {
-        enabled: true,
-        runs: 200
+    compilers: [
+      {
+        version: "0.6.12",
+        settings: {
+          optimizer: {
+            enabled: true,
+            runs: 200
+          }
+        }
+      },
+      {
+        version: "0.5.12"
+      },
+      {
+        version: "0.4.17"
       }
-    }
+    ]
   },
   defaultNetwork: "hardhat",
   networks: {
     hardhat: {},
     ganache: {
-      url: "http://127.0.0.1:7545",
-      accounts: {
-        mnemonic: "vessel fine siege duck actress session effort tower federal attitude race wink"
-      }
+      url: "http://127.0.0.1:7545"
     }
   },
   gasReporter: {

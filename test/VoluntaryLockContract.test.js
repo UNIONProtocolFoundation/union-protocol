@@ -65,7 +65,7 @@ describe("VoluntaryLockContract", () => {
   })
 
   it('Should lock investor tokens increased by interest', async () => {
-    let result
+    let result, receipt
 
     // Check VoluntaryLockContract balance before locking
     result = await unnToken.balanceOf(interestWallet.address)
@@ -77,7 +77,18 @@ describe("VoluntaryLockContract", () => {
 
     // Lock 1000 UNN tokens
     await unnToken.connect(user1).approve(voluntaryLockContract.address, tokens('1000'))
-    await voluntaryLockContract.connect(user1).lockTokens(tokens('1000'), 30)
+    result = await voluntaryLockContract.connect(user1).lockTokens(tokens('1000'), 30)
+    receipt = await result.wait()
+
+    for(let x in receipt.events){
+      if(receipt.events[x].event == 'VoluntaryLock'){
+        expect(receipt.events[x].args.issuerAddress.toString()).to.equal(user1.address)
+        expect(receipt.events[x].args.investedAmount.toString()).to.equal(tokens('1000'))
+        expect(receipt.events[x].args.interest.toString()).to.match(/\d*/)
+        expect(receipt.events[x].args.lockPeriod.toString()).to.equal('30')
+        expect(receipt.events[x].args.releaseTime.toString()).to.match(/\d*/)
+      }
+    }
 
     // Check VoluntaryLockContract balance after locking
     result = await unnToken.balanceOf(interestWallet.address)
